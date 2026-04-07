@@ -1,0 +1,7 @@
+{
+  "controller_host": "0.tcp.ap.ngrok.io",
+  "controller_port": 19467,
+  "auth_token": "MySuperSecretToken_2026_X9!kP#77",
+  "server_name": "gameserver-09",
+  "reconnect_seconds": 5
+}
