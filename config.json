@@ -1,9 +1,0 @@
-{
-  "controller_host": "YOUR_WINDOWS_PUBLIC_IP_OR_DDNS",
-  "controller_port": 5050,
-  "auth_token": "CHANGE_ME_TO_A_LONG_RANDOM_TOKEN",
-  "server_name": "gameserver-01",
-  "reconnect_seconds": 5,
-  "working_directory": ".",
-  "shell_executable": "/bin/bash"
-}
