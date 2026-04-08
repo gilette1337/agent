@@ -39,6 +39,8 @@ class UbuntuAgent:
         self.process_lock = threading.Lock()
         self.current_process: Optional[subprocess.Popen] = None
         self.running = True
+        self._bytes_sent_total = 0
+        self._bytes_sent_lock = threading.Lock()
 
     def load_config(self) -> dict:
         if not CONFIG_PATH.exists():
@@ -54,6 +56,8 @@ class UbuntuAgent:
         raw = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
         with self.send_lock:
             self.sock.sendall(raw)
+        with self._bytes_sent_lock:
+            self._bytes_sent_total += len(raw)
 
     def connect_loop(self) -> None:
         reconnect_seconds = int(self.config.get("reconnect_seconds", 5))
@@ -86,6 +90,8 @@ class UbuntuAgent:
 
         heartbeat_thread = threading.Thread(target=self.heartbeat_loop, daemon=True)
         heartbeat_thread.start()
+        metrics_thread = threading.Thread(target=self.metrics_loop, daemon=True)
+        metrics_thread.start()
 
         while self.running:
             line = self.sock_file.readline()
@@ -99,6 +105,33 @@ class UbuntuAgent:
             try:
                 self.send_json({"type": "heartbeat", "ts": time.time()})
                 time.sleep(10)
+            except Exception:
+                break
+
+    def metrics_loop(self) -> None:
+        cpu_sampler = CpuSampler()
+        last_bytes_sent = 0
+        last_ts = time.time()
+        while self.running and self.sock:
+            try:
+                time.sleep(1.0)
+                now = time.time()
+                interval = max(0.2, now - last_ts)
+                with self._bytes_sent_lock:
+                    total = self._bytes_sent_total
+                delta_bytes = max(0, total - last_bytes_sent)
+                upload_mbps = (delta_bytes / (1024 * 1024)) / interval
+                cpu_percent = cpu_sampler.sample_percent()
+                self.send_json(
+                    {
+                        "type": "metrics",
+                        "ts": now,
+                        "upload_mbps": round(upload_mbps, 3),
+                        "cpu_percent": round(cpu_percent, 1),
+                    }
+                )
+                last_bytes_sent = total
+                last_ts = now
             except Exception:
                 break
 
@@ -205,6 +238,59 @@ class UbuntuAgent:
             return "unknown"
         finally:
             sock.close()
+
+
+class CpuSampler:
+    def __init__(self) -> None:
+        self._prev_total = None
+        self._prev_idle = None
+
+    @staticmethod
+    def _read_proc_stat() -> Optional[tuple[int, int]]:
+        try:
+            with open("/proc/stat", "r", encoding="utf-8") as handle:
+                first = handle.readline()
+        except OSError:
+            return None
+
+        parts = first.split()
+        if len(parts) < 5 or parts[0] != "cpu":
+            return None
+
+        values = []
+        for item in parts[1:]:
+            try:
+                values.append(int(item))
+            except ValueError:
+                values.append(0)
+
+        idle = values[3] + (values[4] if len(values) > 4 else 0)
+        total = sum(values)
+        return total, idle
+
+    def sample_percent(self) -> float:
+        reading = self._read_proc_stat()
+        if not reading:
+            return 0.0
+
+        total, idle = reading
+        if self._prev_total is None or self._prev_idle is None:
+            self._prev_total = total
+            self._prev_idle = idle
+            return 0.0
+
+        total_delta = total - self._prev_total
+        idle_delta = idle - self._prev_idle
+        self._prev_total = total
+        self._prev_idle = idle
+        if total_delta <= 0:
+            return 0.0
+        usage = (total_delta - idle_delta) / total_delta * 100.0
+        if usage < 0:
+            return 0.0
+        if usage > 100:
+            return 100.0
+        return usage
 
 
 
