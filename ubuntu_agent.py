@@ -110,17 +110,26 @@ class UbuntuAgent:
 
     def metrics_loop(self) -> None:
         cpu_sampler = CpuSampler()
+        network_sampler = NetworkSampler()
         last_bytes_sent = 0
         last_ts = time.time()
         while self.running and self.sock:
             try:
                 time.sleep(1.0)
                 now = time.time()
-                interval = max(0.2, now - last_ts)
-                with self._bytes_sent_lock:
-                    total = self._bytes_sent_total
-                delta_bytes = max(0, total - last_bytes_sent)
-                upload_mbps = (delta_bytes / (1024 * 1024)) / interval
+                upload_mbps = network_sampler.sample_upload_mbps(now)
+                if upload_mbps is None:
+                    interval = max(0.2, now - last_ts)
+                    with self._bytes_sent_lock:
+                        total = self._bytes_sent_total
+                    delta_bytes = max(0, total - last_bytes_sent)
+                    upload_mbps = (delta_bytes * 8.0 / 1_000_000.0) / interval
+                    last_bytes_sent = total
+                    last_ts = now
+                else:
+                    with self._bytes_sent_lock:
+                        last_bytes_sent = self._bytes_sent_total
+                    last_ts = now
                 cpu_percent = cpu_sampler.sample_percent()
                 self.send_json(
                     {
@@ -130,8 +139,6 @@ class UbuntuAgent:
                         "cpu_percent": round(cpu_percent, 1),
                     }
                 )
-                last_bytes_sent = total
-                last_ts = now
             except Exception:
                 break
 
@@ -291,6 +298,59 @@ class CpuSampler:
         if usage > 100:
             return 100.0
         return usage
+
+
+class NetworkSampler:
+    def __init__(self) -> None:
+        self._prev_tx_bytes: Optional[int] = None
+        self._prev_ts: Optional[float] = None
+
+    @staticmethod
+    def _read_total_tx_bytes() -> Optional[int]:
+        try:
+            with open("/proc/net/dev", "r", encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except OSError:
+            return None
+
+        total_tx_bytes = 0
+        found_interface = False
+        for raw_line in lines[2:]:
+            if ":" not in raw_line:
+                continue
+            iface_name, metrics = raw_line.split(":", 1)
+            iface_name = iface_name.strip()
+            if iface_name == "lo":
+                continue
+            fields = metrics.split()
+            if len(fields) < 16:
+                continue
+            try:
+                total_tx_bytes += int(fields[8])
+            except ValueError:
+                continue
+            found_interface = True
+
+        if not found_interface:
+            return None
+        return total_tx_bytes
+
+    def sample_upload_mbps(self, now: Optional[float] = None) -> Optional[float]:
+        total_tx_bytes = self._read_total_tx_bytes()
+        if total_tx_bytes is None:
+            return None
+
+        timestamp = now if now is not None else time.time()
+        if self._prev_tx_bytes is None or self._prev_ts is None:
+            self._prev_tx_bytes = total_tx_bytes
+            self._prev_ts = timestamp
+            return 0.0
+
+        interval = max(0.2, timestamp - self._prev_ts)
+        delta_bytes = max(0, total_tx_bytes - self._prev_tx_bytes)
+        self._prev_tx_bytes = total_tx_bytes
+        self._prev_ts = timestamp
+        return (delta_bytes * 8.0 / 1_000_000.0) / interval
 
 
 
