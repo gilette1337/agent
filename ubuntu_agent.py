@@ -59,6 +59,34 @@ class UbuntuAgent:
         with self._bytes_sent_lock:
             self._bytes_sent_total += len(raw)
 
+    def send_json_best_effort(self, payload: dict) -> bool:
+        try:
+            self.send_json(payload)
+            return True
+        except Exception:
+            return False
+
+    def get_running_command_snapshot(self) -> tuple[bool, str]:
+        with self.process_lock:
+            process = self.current_process
+            if not process:
+                return False, ""
+            if process.poll() is not None:
+                self.current_process = None
+                return False, ""
+            return True, getattr(process, "command_text", "")
+
+    def send_state_snapshot(self) -> None:
+        busy, command = self.get_running_command_snapshot()
+        self.send_json_best_effort(
+            {
+                "type": "status",
+                "event": "state_sync",
+                "busy": busy,
+                "command": command,
+            }
+        )
+
     def connect_loop(self) -> None:
         reconnect_seconds = int(self.config.get("reconnect_seconds", 5))
         while self.running:
@@ -76,6 +104,7 @@ class UbuntuAgent:
         self.sock = socket.create_connection((host, port), timeout=15)
         self.sock.settimeout(None)
         self.sock_file = self.sock.makefile("r", encoding="utf-8")
+        busy, current_command = self.get_running_command_snapshot()
 
         hello = {
             "type": "hello",
@@ -85,6 +114,8 @@ class UbuntuAgent:
             "local_ip": self.get_local_ip(),
             "platform": "Ubuntu container",
             "version": "2.0-container",
+            "busy": busy,
+            "current_command": current_command,
         }
         self.send_json(hello)
 
@@ -146,6 +177,7 @@ class UbuntuAgent:
         msg_type = payload.get("type")
         if msg_type == "ack":
             print("[agent] authenticated and connected", flush=True)
+            self.send_state_snapshot()
             return
         if msg_type == "run":
             command = str(payload.get("command", "")).strip()
@@ -161,7 +193,7 @@ class UbuntuAgent:
     def run_command(self, command: str) -> None:
         with self.process_lock:
             if self.current_process and self.current_process.poll() is None:
-                self.send_json(
+                self.send_json_best_effort(
                     {
                         "type": "status",
                         "event": "busy",
@@ -185,30 +217,32 @@ class UbuntuAgent:
             process.command_text = command  # type: ignore[attr-defined]
             self.current_process = process
 
-        self.send_json({"type": "status", "event": "command_started", "command": command})
+        self.send_json_best_effort({"type": "status", "event": "command_started", "command": command})
 
         try:
             assert process.stdout is not None
             for line in iter(process.stdout.readline, ""):
                 clean_line = line.rstrip("\n")
-                self.send_json({"type": "log", "line": clean_line})
+                self.send_json_best_effort({"type": "log", "line": clean_line})
             process.stdout.close()
             exit_code = process.wait()
-            self.send_json({"type": "status", "event": "command_finished", "exit_code": exit_code})
+            self.send_json_best_effort({"type": "status", "event": "command_finished", "exit_code": exit_code})
         except Exception as exc:
-            self.send_json({"type": "status", "event": "error", "message": str(exc)})
+            self.send_json_best_effort({"type": "status", "event": "error", "message": str(exc)})
         finally:
             with self.process_lock:
-                self.current_process = None
+                if self.current_process is process:
+                    self.current_process = None
 
     def interrupt_command(self) -> None:
         with self.process_lock:
             process = self.current_process
             if not process or process.poll() is not None:
-                self.send_json({"type": "status", "event": "interrupt_not_needed"})
+                self.current_process = None
+                self.send_json_best_effort({"type": "status", "event": "interrupt_not_needed"})
                 return
             os.killpg(os.getpgid(process.pid), signal.SIGINT)
-            self.send_json({"type": "status", "event": "interrupt_sent"})
+            self.send_json_best_effort({"type": "status", "event": "interrupt_sent"})
 
         end_time = time.time() + 5
         while time.time() < end_time:
@@ -219,7 +253,7 @@ class UbuntuAgent:
         with self.process_lock:
             if self.current_process and self.current_process.poll() is None:
                 os.killpg(os.getpgid(self.current_process.pid), signal.SIGTERM)
-                self.send_json({"type": "status", "event": "forced_terminate"})
+                self.send_json_best_effort({"type": "status", "event": "forced_terminate"})
 
     def cleanup_connection(self) -> None:
         try:
